@@ -14,7 +14,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Generate Video Sitemap
         shell: python
@@ -23,52 +23,91 @@ jobs:
           import html
           import urllib.request
           import xml.etree.ElementTree as ET
-          from datetime import datetime, timezone
 
-          FEED_URL = "https://www.toonshowhindi.in/feeds/posts/default?alt=atom&max-results=150"
+          BLOG_URL = "https://www.toonshowhindi.in/"
+          FEED_BASE = (
+              "https://www.toonshowhindi.in/"
+              "feeds/posts/default?alt=atom"
+              "&max-results=150"
+          )
 
-          VIDEO_NS = "http://www.google.com/schemas/sitemap-video/1.1"
           SITEMAP_NS = "http://www.sitemaps.org/schemas/sitemap/0.9"
+          VIDEO_NS = "http://www.google.com/schemas/sitemap-video/1.1"
+          ATOM_NS = "http://www.w3.org/2005/Atom"
 
           ET.register_namespace("", SITEMAP_NS)
           ET.register_namespace("video", VIDEO_NS)
 
-          def clean_text(value):
+          def clean_html(value):
               value = html.unescape(value or "")
-              value = re.sub(r"<[^>]+>", " ", value)
+
+              value = re.sub(
+                  r"<style\b[^>]*>.*?</style>",
+                  " ",
+                  value,
+                  flags=re.I | re.S
+              )
+
+              value = re.sub(
+                  r"<script\b[^>]*>.*?</script>",
+                  " ",
+                  value,
+                  flags=re.I | re.S
+              )
+
+              value = re.sub(
+                  r"<noscript\b[^>]*>.*?</noscript>",
+                  " ",
+                  value,
+                  flags=re.I | re.S
+              )
+
+              value = re.sub(
+                  r"<[^>]+>",
+                  " ",
+                  value
+              )
+
+              value = html.unescape(value)
               value = re.sub(r"\s+", " ", value)
+
               return value.strip()
 
           def youtube_id(text):
               patterns = [
-                  r"youtube\.com/embed/([A-Za-z0-9_-]{11})",
-                  r"youtube\.com/watch\?[^\"'<>\s]*v=([A-Za-z0-9_-]{11})",
-                  r"youtu\.be/([A-Za-z0-9_-]{11})",
-                  r"youtube-nocookie\.com/embed/([A-Za-z0-9_-]{11})"
+                  r"youtube(?:-nocookie)?\.com/embed/([A-Za-z0-9_-]{11})",
+                  r"youtube\.com/watch\?[^\"'<>\s]*[?&]v=([A-Za-z0-9_-]{11})",
+                  r"youtu\.be/([A-Za-z0-9_-]{11})"
               ]
 
               for pattern in patterns:
-                  match = re.search(pattern, text, re.I)
+                  match = re.search(pattern, text or "", re.I)
+
                   if match:
                       return match.group(1)
 
               return None
 
-          request = urllib.request.Request(
-              FEED_URL,
-              headers={
-                  "User-Agent": "ToonShow-Hindi-Video-Sitemap/1.0"
-              }
-          )
+          def fetch_feed(start_index):
+              url = (
+                  FEED_BASE
+                  + "&start-index="
+                  + str(start_index)
+              )
 
-          with urllib.request.urlopen(request, timeout=30) as response:
-              feed_data = response.read()
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent":
+                      "ToonShow-Hindi-Video-Sitemap/1.0"
+                  }
+              )
 
-          root = ET.fromstring(feed_data)
-
-          ns = {
-              "atom": "http://www.w3.org/2005/Atom"
-          }
+              with urllib.request.urlopen(
+                  request,
+                  timeout=30
+              ) as response:
+                  return response.read()
 
           urlset = ET.Element(
               f"{{{SITEMAP_NS}}}urlset"
@@ -77,100 +116,168 @@ jobs:
           seen_urls = set()
           seen_videos = set()
 
-          for entry in root.findall("atom:entry", ns):
+          start_index = 1
+          page_count = 0
 
-              title_node = entry.find("atom:title", ns)
-              link_nodes = entry.findall("atom:link", ns)
-              content_node = entry.find("atom:content", ns)
-              summary_node = entry.find("atom:summary", ns)
-              published_node = entry.find("atom:published", ns)
+          while True:
+              feed_data = fetch_feed(start_index)
+              root = ET.fromstring(feed_data)
 
-              title = clean_text(
-                  title_node.text if title_node is not None else ""
+              entries = root.findall(
+                  f"{{{ATOM_NS}}}entry"
               )
 
-              post_url = ""
+              if not entries:
+                  break
 
-              for link in link_nodes:
-                  if link.get("rel") == "alternate":
-                      post_url = link.get("href", "")
-                      break
+              page_count += 1
 
-              content = ""
-              if content_node is not None:
-                  content = content_node.text or ""
+              for entry in entries:
+                  title_node = entry.find(
+                      f"{{{ATOM_NS}}}title"
+                  )
 
-              if not content and summary_node is not None:
-                  content = summary_node.text or ""
+                  content_node = entry.find(
+                      f"{{{ATOM_NS}}}content"
+                  )
 
-              video = youtube_id(content)
+                  summary_node = entry.find(
+                      f"{{{ATOM_NS}}}summary"
+                  )
 
-              if not video:
-                  continue
+                  title = (
+                      title_node.text
+                      if title_node is not None
+                      else ""
+                  )
 
-              if not post_url:
-                  continue
+                  title = clean_html(title)
 
-              if post_url in seen_urls or video in seen_videos:
-                  continue
+                  raw_content = ""
 
-              seen_urls.add(post_url)
-              seen_videos.add(video)
+                  if content_node is not None:
+                      raw_content = content_node.text or ""
 
-              description = clean_text(content)
+                  if not raw_content and summary_node is not None:
+                      raw_content = summary_node.text or ""
 
-              if len(description) > 1000:
-                  description = description[:997] + "..."
+                  video = youtube_id(raw_content)
 
-              url_node = ET.SubElement(
-                  urlset,
-                  f"{{{SITEMAP_NS}}}url"
-              )
+                  if not video:
+                      continue
 
-              loc = ET.SubElement(
-                  url_node,
-                  f"{{{SITEMAP_NS}}}loc"
-              )
-              loc.text = post_url
+                  post_url = ""
 
-              video_node = ET.SubElement(
-                  url_node,
-                  f"{{{VIDEO_NS}}}video"
-              )
+                  for link in entry.findall(
+                      f"{{{ATOM_NS}}}link"
+                  ):
+                      if link.get("rel") == "alternate":
+                          post_url = link.get(
+                              "href",
+                              ""
+                          )
+                          break
 
-              thumbnail = ET.SubElement(
-                  video_node,
-                  f"{{{VIDEO_NS}}}thumbnail_loc"
-              )
-              thumbnail.text = (
-                  f"https://img.youtube.com/vi/{video}/maxresdefault.jpg"
-              )
+                  if not post_url:
+                      continue
 
-              video_title = ET.SubElement(
-                  video_node,
-                  f"{{{VIDEO_NS}}}title"
-              )
-              video_title.text = title[:2048]
+                  if not post_url.startswith(BLOG_URL):
+                      continue
 
-              video_description = ET.SubElement(
-                  video_node,
-                  f"{{{VIDEO_NS}}}description"
-              )
-              video_description.text = (
-                  description[:2048] if description else title
-              )
+                  if post_url in seen_urls:
+                      continue
 
-              player = ET.SubElement(
-                  video_node,
-                  f"{{{VIDEO_NS}}}player_loc"
-              )
-              player.text = (
-                  f"https://www.youtube.com/embed/{video}?rel=0"
-              )
+                  if video in seen_videos:
+                      continue
 
-          tree = ET.ElementTree(urlset)
+                  description = clean_html(
+                      raw_content
+                  )
 
-          ET.indent(tree, space="  ")
+                  description = re.sub(
+                      r"\s+",
+                      " ",
+                      description
+                  ).strip()
+
+                  if not description:
+                      description = title
+
+                  if len(description) > 2048:
+                      description = (
+                          description[:2045]
+                          + "..."
+                      )
+
+                  url_node = ET.SubElement(
+                      urlset,
+                      f"{{{SITEMAP_NS}}}url"
+                  )
+
+                  loc_node = ET.SubElement(
+                      url_node,
+                      f"{{{SITEMAP_NS}}}loc"
+                  )
+
+                  loc_node.text = post_url
+
+                  video_node = ET.SubElement(
+                      url_node,
+                      f"{{{VIDEO_NS}}}video"
+                  )
+
+                  thumbnail_node = ET.SubElement(
+                      video_node,
+                      f"{{{VIDEO_NS}}}thumbnail_loc"
+                  )
+
+                  thumbnail_node.text = (
+                      "https://img.youtube.com/vi/"
+                      + video
+                      + "/maxresdefault.jpg"
+                  )
+
+                  title_node = ET.SubElement(
+                      video_node,
+                      f"{{{VIDEO_NS}}}title"
+                  )
+
+                  title_node.text = title[:2048]
+
+                  description_node = ET.SubElement(
+                      video_node,
+                      f"{{{VIDEO_NS}}}description"
+                  )
+
+                  description_node.text = description
+
+                  player_node = ET.SubElement(
+                      video_node,
+                      f"{{{VIDEO_NS}}}player_loc"
+                  )
+
+                  player_node.text = (
+                      "https://www.youtube.com/embed/"
+                      + video
+                      + "?rel=0"
+                  )
+
+                  seen_urls.add(post_url)
+                  seen_videos.add(video)
+
+              if len(entries) < 150:
+                  break
+
+              start_index += 150
+
+          ET.indent(
+              urlset,
+              space="  "
+          )
+
+          tree = ET.ElementTree(
+              urlset
+          )
 
           tree.write(
               "video-sitemap.xml",
@@ -179,8 +286,14 @@ jobs:
           )
 
           print(
-              f"Generated Video Sitemap with "
-              f"{len(seen_urls)} video pages."
+              "Blogger feed pages read:",
+              page_count
+          )
+
+          print(
+              "Generated Video Sitemap with",
+              len(seen_urls),
+              "video pages."
           )
 
       - name: Validate sitemap XML
@@ -188,9 +301,34 @@ jobs:
         run: |
           import xml.etree.ElementTree as ET
 
-          ET.parse("video-sitemap.xml")
+          tree = ET.parse(
+              "video-sitemap.xml"
+          )
 
-          print("Video Sitemap XML validation: OK")
+          root = tree.getroot()
+
+          if not root.tag.endswith("urlset"):
+              raise SystemExit(
+                  "Invalid sitemap root element."
+              )
+
+          urls = root.findall(
+              "{http://www.sitemaps.org/schemas/sitemap/0.9}url"
+          )
+
+          if not urls:
+              raise SystemExit(
+                  "Sitemap contains no video URLs."
+              )
+
+          print(
+              "Video Sitemap XML validation: OK"
+          )
+
+          print(
+              "Video URL entries:",
+              len(urls)
+          )
 
       - name: Commit updated sitemap
         run: |
