@@ -1,0 +1,207 @@
+name: Update ToonShow Hindi Video Sitemap
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  update-video-sitemap:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate Video Sitemap
+        shell: python
+        run: |
+          import re
+          import html
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone
+
+          FEED_URL = "https://www.toonshowhindi.in/feeds/posts/default?alt=atom&max-results=150"
+
+          VIDEO_NS = "http://www.google.com/schemas/sitemap-video/1.1"
+          SITEMAP_NS = "http://www.sitemaps.org/schemas/sitemap/0.9"
+
+          ET.register_namespace("", SITEMAP_NS)
+          ET.register_namespace("video", VIDEO_NS)
+
+          def clean_text(value):
+              value = html.unescape(value or "")
+              value = re.sub(r"<[^>]+>", " ", value)
+              value = re.sub(r"\s+", " ", value)
+              return value.strip()
+
+          def youtube_id(text):
+              patterns = [
+                  r"youtube\.com/embed/([A-Za-z0-9_-]{11})",
+                  r"youtube\.com/watch\?[^\"'<>\s]*v=([A-Za-z0-9_-]{11})",
+                  r"youtu\.be/([A-Za-z0-9_-]{11})",
+                  r"youtube-nocookie\.com/embed/([A-Za-z0-9_-]{11})"
+              ]
+
+              for pattern in patterns:
+                  match = re.search(pattern, text, re.I)
+                  if match:
+                      return match.group(1)
+
+              return None
+
+          request = urllib.request.Request(
+              FEED_URL,
+              headers={
+                  "User-Agent": "ToonShow-Hindi-Video-Sitemap/1.0"
+              }
+          )
+
+          with urllib.request.urlopen(request, timeout=30) as response:
+              feed_data = response.read()
+
+          root = ET.fromstring(feed_data)
+
+          ns = {
+              "atom": "http://www.w3.org/2005/Atom"
+          }
+
+          urlset = ET.Element(
+              f"{{{SITEMAP_NS}}}urlset"
+          )
+
+          seen_urls = set()
+          seen_videos = set()
+
+          for entry in root.findall("atom:entry", ns):
+
+              title_node = entry.find("atom:title", ns)
+              link_nodes = entry.findall("atom:link", ns)
+              content_node = entry.find("atom:content", ns)
+              summary_node = entry.find("atom:summary", ns)
+              published_node = entry.find("atom:published", ns)
+
+              title = clean_text(
+                  title_node.text if title_node is not None else ""
+              )
+
+              post_url = ""
+
+              for link in link_nodes:
+                  if link.get("rel") == "alternate":
+                      post_url = link.get("href", "")
+                      break
+
+              content = ""
+              if content_node is not None:
+                  content = content_node.text or ""
+
+              if not content and summary_node is not None:
+                  content = summary_node.text or ""
+
+              video = youtube_id(content)
+
+              if not video:
+                  continue
+
+              if not post_url:
+                  continue
+
+              if post_url in seen_urls or video in seen_videos:
+                  continue
+
+              seen_urls.add(post_url)
+              seen_videos.add(video)
+
+              description = clean_text(content)
+
+              if len(description) > 1000:
+                  description = description[:997] + "..."
+
+              url_node = ET.SubElement(
+                  urlset,
+                  f"{{{SITEMAP_NS}}}url"
+              )
+
+              loc = ET.SubElement(
+                  url_node,
+                  f"{{{SITEMAP_NS}}}loc"
+              )
+              loc.text = post_url
+
+              video_node = ET.SubElement(
+                  url_node,
+                  f"{{{VIDEO_NS}}}video"
+              )
+
+              thumbnail = ET.SubElement(
+                  video_node,
+                  f"{{{VIDEO_NS}}}thumbnail_loc"
+              )
+              thumbnail.text = (
+                  f"https://img.youtube.com/vi/{video}/maxresdefault.jpg"
+              )
+
+              video_title = ET.SubElement(
+                  video_node,
+                  f"{{{VIDEO_NS}}}title"
+              )
+              video_title.text = title[:2048]
+
+              video_description = ET.SubElement(
+                  video_node,
+                  f"{{{VIDEO_NS}}}description"
+              )
+              video_description.text = (
+                  description[:2048] if description else title
+              )
+
+              player = ET.SubElement(
+                  video_node,
+                  f"{{{VIDEO_NS}}}player_loc"
+              )
+              player.text = (
+                  f"https://www.youtube.com/embed/{video}?rel=0"
+              )
+
+          tree = ET.ElementTree(urlset)
+
+          ET.indent(tree, space="  ")
+
+          tree.write(
+              "video-sitemap.xml",
+              encoding="utf-8",
+              xml_declaration=True
+          )
+
+          print(
+              f"Generated Video Sitemap with "
+              f"{len(seen_urls)} video pages."
+          )
+
+      - name: Validate sitemap XML
+        shell: python
+        run: |
+          import xml.etree.ElementTree as ET
+
+          ET.parse("video-sitemap.xml")
+
+          print("Video Sitemap XML validation: OK")
+
+      - name: Commit updated sitemap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add video-sitemap.xml
+
+          if git diff --cached --quiet; then
+            echo "No sitemap changes."
+          else
+            git commit -m "Update ToonShow Hindi video sitemap"
+            git push
+          fi
