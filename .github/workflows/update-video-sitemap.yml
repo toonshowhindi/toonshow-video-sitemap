@@ -1,0 +1,460 @@
+name: Update ToonShow Hindi Video Sitemap
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-toonshow-video-sitemap
+  cancel-in-progress: true
+
+jobs:
+  update-video-sitemap:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Generate Video Sitemap
+        shell: python
+        env:
+          BLOG_URL: "https://www.toonshowhindi.in/"
+        run: |
+          import os
+          import html
+          import re
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from urllib.parse import quote
+
+          BLOG_URL = os.environ["BLOG_URL"].rstrip("/") + "/"
+          FEED_BASE = BLOG_URL + "feeds/posts/default"
+          OUTPUT = "video-sitemap.xml"
+
+          ATOM = "http://www.w3.org/2005/Atom"
+          SITEMAP = "http://www.sitemaps.org/schemas/sitemap/0.9"
+          VIDEO = "http://www.google.com/schemas/sitemap-video/1.1"
+
+          NS = {
+              "atom": ATOM
+          }
+
+          ET.register_namespace("", SITEMAP)
+          ET.register_namespace("video", VIDEO)
+
+          # Match the same embedded YouTube architecture
+          # used by ToonShow Hindi V3.5.2.
+          YOUTUBE_EMBED_PATTERN = re.compile(
+              r"(?:youtube\.com|youtube-nocookie\.com)/embed/([A-Za-z0-9_-]{11})",
+              re.IGNORECASE
+          )
+
+          def fetch_feed(start_index):
+              url = (
+                  FEED_BASE
+                  + "?alt=atom"
+                  + "&max-results=150"
+                  + f"&start-index={start_index}"
+              )
+
+              request = urllib.request.Request(
+                  url,
+                  headers={
+                      "User-Agent": "ToonShowHindi-VideoSitemap/2.0"
+                  }
+              )
+
+              with urllib.request.urlopen(
+                  request,
+                  timeout=30
+              ) as response:
+                  return ET.fromstring(response.read())
+
+          def clean_html(value):
+              if not value:
+                  return ""
+
+              value = html.unescape(value)
+
+              # Remove HTML comments.
+              value = re.sub(
+                  r"<!--.*?-->",
+                  " ",
+                  value,
+                  flags=re.DOTALL
+              )
+
+              # Remove style, script and noscript blocks.
+              value = re.sub(
+                  r"<(style|script|noscript)\b[^>]*>.*?</\1>",
+                  " ",
+                  value,
+                  flags=re.IGNORECASE | re.DOTALL
+              )
+
+              # Remove remaining HTML tags.
+              value = re.sub(
+                  r"<[^>]+>",
+                  " ",
+                  value
+              )
+
+              # Normalize whitespace.
+              value = re.sub(
+                  r"\s+",
+                  " ",
+                  value
+              )
+
+              return value.strip()
+
+          def limit_text(value, maximum):
+              value = re.sub(
+                  r"\s+",
+                  " ",
+                  value or ""
+              ).strip()
+
+              if len(value) <= maximum:
+                  return value
+
+              cut = value[:maximum]
+              last_space = cut.rfind(" ")
+
+              if last_space >= int(maximum * 0.70):
+                  cut = cut[:last_space]
+
+              return cut.rstrip(" .,-:;|")
+
+          def normalize_url(url):
+              # Encode spaces and other unsafe characters while
+              # preserving normal URL syntax and existing % encoding.
+              return quote(
+                  url,
+                  safe=":/?&=#%+-._~!$'()*+,;@"
+              )
+
+          def find_youtube_id(value):
+              if not value:
+                  return None
+
+              match = YOUTUBE_EMBED_PATTERN.search(value)
+
+              if match:
+                  return match.group(1)
+
+              return None
+
+          entries = []
+          seen_urls = set()
+          seen_videos = set()
+
+          start_index = 1
+          page_count = 0
+
+          while True:
+              page_count += 1
+
+              print(
+                  "Fetching Blogger feed page "
+                  + str(page_count)
+                  + " (start-index="
+                  + str(start_index)
+                  + ")"
+              )
+
+              root = fetch_feed(start_index)
+
+              feed_entries = root.findall(
+                  "atom:entry",
+                  NS
+              )
+
+              if not feed_entries:
+                  break
+
+              for entry in feed_entries:
+
+                  # Find the published/alternate post URL.
+                  post_url = None
+
+                  for link_node in entry.findall(
+                      "atom:link",
+                      NS
+                  ):
+                      rel = link_node.get("rel")
+                      href = link_node.get("href")
+
+                      if rel == "alternate" and href:
+                          post_url = href
+                          break
+
+                  if not post_url:
+                      continue
+
+                  post_url = normalize_url(post_url)
+
+                  # Get the real Blogger post title.
+                  title_node = entry.find(
+                      "atom:title",
+                      NS
+                  )
+
+                  raw_title = ""
+
+                  if title_node is not None:
+                      raw_title = title_node.text or ""
+
+                  title = clean_html(raw_title)
+
+                  # Get full content.
+                  content_node = entry.find(
+                      "atom:content",
+                      NS
+                  )
+
+                  raw_content = ""
+
+                  if content_node is not None:
+                      raw_content = content_node.text or ""
+
+                  # Get feed summary.
+                  summary_node = entry.find(
+                      "atom:summary",
+                      NS
+                  )
+
+                  raw_summary = ""
+
+                  if summary_node is not None:
+                      raw_summary = summary_node.text or ""
+
+                  # Detect only embedded YouTube videos,
+                  # matching V3.5.2's page-level detection.
+                  video_id = find_youtube_id(
+                      raw_content
+                  )
+
+                  if not video_id:
+                      video_id = find_youtube_id(
+                          raw_summary
+                      )
+
+                  if not video_id:
+                      continue
+
+                  # Prevent duplicate URLs.
+                  if post_url in seen_urls:
+                      continue
+
+                  # Prevent duplicate YouTube videos.
+                  if video_id in seen_videos:
+                      continue
+
+                  # Prefer the Blogger feed summary for the sitemap
+                  # description, then fall back to post content.
+                  description = clean_html(
+                      raw_summary
+                  )
+
+                  if not description:
+                      description = clean_html(
+                          raw_content
+                      )
+
+                  if not description:
+                      description = (
+                          title
+                          + " | ToonShow Hindi animated story."
+                      )
+
+                  if not title:
+                      title = (
+                          "ToonShow Hindi Video"
+                      )
+
+                  title = limit_text(
+                      title,
+                      100
+                  )
+
+                  description = limit_text(
+                      description,
+                      2048
+                  )
+
+                  entries.append({
+                      "url": post_url,
+                      "video": video_id,
+                      "title": title,
+                      "description": description
+                  })
+
+                  seen_urls.add(post_url)
+                  seen_videos.add(video_id)
+
+              # Continue pagination when Blogger returned a full page.
+              if len(feed_entries) < 150:
+                  break
+
+              start_index += 150
+
+          # Safety protection:
+          # Never overwrite an existing sitemap with an empty result.
+          if not entries:
+              raise RuntimeError(
+                  "No embedded YouTube video posts were detected. "
+                  "Refusing to overwrite the sitemap."
+              )
+
+          # Duplicate protection.
+          if len(entries) != len(seen_urls):
+              raise RuntimeError(
+                  "Duplicate post URLs detected."
+              )
+
+          if len(entries) != len(seen_videos):
+              raise RuntimeError(
+                  "Duplicate YouTube video IDs detected."
+              )
+
+          # URL safety check.
+          for item in entries:
+              if " " in item["url"]:
+                  raise RuntimeError(
+                      "Literal space found in sitemap URL: "
+                      + item["url"]
+                  )
+
+          # Create sitemap root.
+          urlset = ET.Element(
+              f"{{{SITEMAP}}}urlset"
+          )
+
+          for item in entries:
+
+              url_node = ET.SubElement(
+                  urlset,
+                  f"{{{SITEMAP}}}url"
+              )
+
+              loc = ET.SubElement(
+                  url_node,
+                  f"{{{SITEMAP}}}loc"
+              )
+
+              loc.text = item["url"]
+
+              video_node = ET.SubElement(
+                  url_node,
+                  f"{{{VIDEO}}}video"
+              )
+
+              thumbnail = ET.SubElement(
+                  video_node,
+                  f"{{{VIDEO}}}thumbnail_loc"
+              )
+
+              thumbnail.text = (
+                  "https://img.youtube.com/vi/"
+                  + item["video"]
+                  + "/maxresdefault.jpg"
+              )
+
+              video_title = ET.SubElement(
+                  video_node,
+                  f"{{{VIDEO}}}title"
+              )
+
+              video_title.text = item["title"]
+
+              video_description = ET.SubElement(
+                  video_node,
+                  f"{{{VIDEO}}}description"
+              )
+
+              video_description.text = item["description"]
+
+              player = ET.SubElement(
+                  video_node,
+                  f"{{{VIDEO}}}player_loc"
+              )
+
+              player.text = (
+                  "https://www.youtube.com/embed/"
+                  + item["video"]
+                  + "?rel=0"
+              )
+
+          tree = ET.ElementTree(urlset)
+
+          ET.indent(
+              tree,
+              space="  "
+          )
+
+          tree.write(
+              OUTPUT,
+              encoding="utf-8",
+              xml_declaration=True
+          )
+
+          # Final XML validation.
+          ET.parse(OUTPUT)
+
+          print("")
+          print("========================================")
+          print("ToonShow Hindi Video Sitemap")
+          print("========================================")
+          print("Blogger feed pages read:", page_count)
+          print("Video entries generated:", len(entries))
+          print("Unique post URLs:", len(seen_urls))
+          print("Unique YouTube videos:", len(seen_videos))
+          print("XML validation: OK")
+          print("Output:", OUTPUT)
+          print("========================================")
+
+      - name: Commit updated sitemap
+        shell: bash
+        run: |
+          set -e
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add video-sitemap.xml
+
+          if git diff --cached --quiet; then
+            echo "No sitemap changes detected."
+            exit 0
+          fi
+
+          git commit -m "Update ToonShow Hindi video sitemap"
+
+          for attempt in 1 2 3 4 5; do
+            echo "Push attempt $attempt"
+
+            git fetch origin main
+
+            if git rebase origin/main; then
+              if git push origin HEAD:main; then
+                echo "Push successful."
+                exit 0
+              fi
+            else
+              git rebase --abort 2>/dev/null || true
+            fi
+
+            echo "Push failed. Retrying..."
+            sleep 5
+          done
+
+          echo "ERROR: Unable to push after 5 attempts."
+          exit 1
